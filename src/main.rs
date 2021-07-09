@@ -1,82 +1,101 @@
-use hyper::client::HttpConnector;
-use hyper::service::{make_service_fn, service_fn};
+use hyper::service::Service;
 use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
-type Result<T> = std::result::Result<T, GenericError>;
+type HttpClient = Client<hyper::client::HttpConnector>;
 
 static NOTFOUND: &[u8] = b"Not Found";
 
-async fn client_request_response(
-    client: &Client<HttpConnector>,
-    mut req: Request<Body>,
-) -> Result<Response<Body>> {
-    let out_addr: SocketAddr = "127.0.0.1:3001".parse().unwrap();
-
-    let uri_string = format!(
-        "http://{}{}",
-        out_addr,
-        req.uri()
-            .path_and_query()
-            .map(|x| x.as_str())
-            .unwrap_or("/")
-    );
-    let uri = uri_string.parse().unwrap();
-    *req.uri_mut() = uri;
-    let response = client.request(req).await?;
-    Ok(response)
-}
-
-async fn response_examples(
-    req: Request<Body>,
-    client: Client<HttpConnector>,
-) -> Result<Response<Body>> {
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/health") => Ok(Response::new(r#"{}"#.into())),
-        (&Method::GET, "/proxy") => client_request_response(&client, req).await,
-        _ => {
-            // Return 404 not found response.
-            Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(NOTFOUND.into())
-                .unwrap())
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
-    // let in_addr = ([127, 0, 0, 1], 3001).into();
     let in_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
     let out_addr: SocketAddr = ([127, 0, 0, 1], 3001).into();
 
     let client_main = Client::new();
 
-    // let out_addr_clone = out_addr.clone();
-
-    // The closure inside `make_service_fn` is run for each connection,
-    // creating a 'service' to handle requests for that specific connection.
-    let make_service = make_service_fn(move |_| {
-        let client = client_main.clone();
-
-        async move {
-            // This is the `Service` that will handle the connection.
-            // `service_fn` is a helper to convert a function that
-            // returns a Response into a `Service`.
-            Ok::<_, GenericError>(service_fn(move |req| {
-                // Clone again to ensure that client outlives this closure.
-                response_examples(req, client.to_owned())
-            }))
-        }
+    let server = Server::bind(&in_addr).serve(MakeSvc {
+        target: out_addr,
+        client: client_main,
     });
-
-    let server = Server::bind(&in_addr).serve(make_service);
 
     println!("Listening on http://{}", in_addr);
     println!("Proxying on http://{}", out_addr);
 
     if let Err(e) = server.await {
         eprintln!("server error: {}", e);
+    }
+}
+
+struct Svc {
+    target: SocketAddr,
+    client: HttpClient,
+}
+
+impl Service<Request<Body>> for Svc {
+    type Response = Response<Body>;
+    type Error = GenericError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        fn mk_response(s: String) -> Result<Response<Body>, GenericError> {
+            Ok(Response::builder().body(Body::from(s)).unwrap())
+        }
+
+        let res = match (req.method(), req.uri().path()) {
+            (&Method::GET, "/health") => mk_response(r#"{}"#.into()),
+            (&Method::GET, "/proxy") => {
+                let uri_string = format!(
+                    "http://{}{}",
+                    self.target,
+                    req.uri()
+                        .path_and_query()
+                        .map(|x| x.as_str())
+                        .unwrap_or("/")
+                );
+                let uri = uri_string.parse().unwrap();
+                *req.uri_mut() = uri;
+                let result = self.client.request(req);
+                return Box::pin(async move { Ok(result.await?) });
+            }
+            _ => {
+                // Return 404 not found response.
+                Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(NOTFOUND.into())
+                    .unwrap())
+            }
+        };
+
+        Box::pin(async { res })
+    }
+}
+
+struct MakeSvc {
+    target: SocketAddr,
+    client: HttpClient,
+}
+
+impl<T> Service<T> for MakeSvc {
+    type Response = Svc;
+    type Error = GenericError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: T) -> Self::Future {
+        let target = self.target.clone();
+        let client = self.client.clone();
+        let fut = async move { Ok(Svc { target, client }) };
+        Box::pin(fut)
     }
 }
