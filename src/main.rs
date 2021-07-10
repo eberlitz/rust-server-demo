@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type HttpClient = Client<hyper::client::HttpConnector>;
-type Workers = Arc<Mutex<HashMap<String, bool>>>;
+type Workers = Arc<WorkerManager>;
 
 static NOTFOUND: &[u8] = b"Not Found";
 
@@ -20,7 +20,7 @@ async fn main() {
     let in_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
     let target: SocketAddr = ([127, 0, 0, 1], 3001).into();
     let client = Client::new();
-    let workers = Arc::new(Mutex::new(HashMap::new()));
+    let workers = WorkerManager::new();
 
     let server = Server::bind(&in_addr).serve(MakeSvc {
         target,
@@ -33,6 +33,31 @@ async fn main() {
 
     if let Err(e) = server.await {
         eprintln!("server error: {}", e);
+    }
+}
+
+struct WorkerManager {
+    workers: Arc<Mutex<HashMap<String, bool>>>,
+}
+impl WorkerManager {
+    pub fn new() -> Arc<Self> {
+        let m = WorkerManager {
+            workers: Default::default(),
+        };
+        Arc::new(m)
+    }
+
+    pub fn get(&self, key: &str) -> bool {
+        let mut map = self.workers.lock().unwrap();
+        // Return a clone if the value is a complex type.
+        if let Some(&value) = map.get(key) {
+            value
+        } else {
+            println!("Creating {}", key);
+            let value = true;
+            map.insert(key.into(), value);
+            value
+        }
     }
 }
 
@@ -65,12 +90,10 @@ impl Service<Request<Body>> for Svc {
             let route_name = req.uri().path().strip_prefix("/proxy/").unwrap_or("");
             println!("Receive {}", route_name);
 
-            let mut map = self.workers.lock().unwrap();
-            if !map.contains_key(route_name) {
-                println!("Creating {}", route_name);
-                map.insert(route_name.into(), true);
+            let r = self.workers.get(route_name).clone();
+            if r {
+                println!("Found route")
             }
-            drop(map);
 
             let uri_string = format!(
                 "http://{}{}",
@@ -113,7 +136,7 @@ impl<T> Service<T> for MakeSvc {
     fn call(&mut self, _: T) -> Self::Future {
         let target = self.target.clone();
         let client = self.client.clone();
-        let workers = Arc::clone(&self.workers);
+        let workers = self.workers.clone();
         Box::pin(async move {
             Ok(Svc {
                 target,
