@@ -1,17 +1,15 @@
-use hyper::{
-    service::Service,
-    {Body, Client, Method, Request, Response, Server, StatusCode},
-};
+pub use anyhow::anyhow;
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type HttpClient = Client<hyper::client::HttpConnector>;
 type Workers = Arc<WorkerManager>;
+/// A generic wrapper that can encapsulate any concrete error type.
+pub type AnyError = anyhow::Error;
 
 static NOTFOUND: &[u8] = b"Not Found";
 
@@ -22,11 +20,23 @@ async fn main() {
     let client = Client::new();
     let workers = WorkerManager::new();
 
-    let server = Server::bind(&in_addr).serve(MakeSvc {
+    let rp = std::sync::Arc::new(Svc {
         target,
         client,
         workers,
     });
+
+    let make_svc = make_service_fn(move |_conn| {
+        let rp = rp.clone();
+        async {
+            Ok::<_, GenericError>(service_fn(move |req| {
+                let rp = rp.clone();
+                async move { rp.handle(req).await }
+            }))
+        }
+    });
+
+    let server = Server::bind(&in_addr).serve(make_svc);
 
     println!("Listening on http://{}", in_addr);
     println!("Proxying on http://{}", target);
@@ -47,16 +57,16 @@ impl WorkerManager {
         Arc::new(m)
     }
 
-    pub fn get(&self, key: &str) -> bool {
+    pub async fn get(&self, key: &str) -> Result<bool, AnyError> {
         let mut map = self.workers.lock().unwrap();
         // Return a clone if the value is a complex type.
         if let Some(&value) = map.get(key) {
-            value
+            Ok(value)
         } else {
             println!("Creating {}", key);
             let value = true;
             map.insert(key.into(), value);
-            value
+            Ok(value)
         }
     }
 }
@@ -67,82 +77,48 @@ struct Svc {
     workers: Workers,
 }
 
-impl Service<Request<Body>> for Svc {
-    type Response = Response<Body>;
-    type Error = GenericError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+impl Svc {
+    async fn handle(&self, req: Request<Body>) -> Result<Response<Body>, GenericError> {
         fn mk_response(s: String) -> Result<Response<Body>, GenericError> {
             Ok(Response::builder().body(Body::from(s)).unwrap())
         }
-
         if req.method() == &Method::GET && req.uri().path() == "/health" {
-            return Box::pin(async { mk_response(r#"{}"#.into()) });
+            return mk_response(r#"{}"#.into());
         }
 
         // "/proxy/{routeName}"
         if req.uri().path().starts_with("/proxy/") {
-            let route_name = req.uri().path().strip_prefix("/proxy/").unwrap_or("");
-            println!("Receive {}", route_name);
-
-            let r = self.workers.get(route_name).clone();
-            if r {
-                println!("Found route")
-            }
-
-            let uri_string = format!(
-                "http://{}{}",
-                self.target,
-                req.uri()
-                    .path_and_query()
-                    .map(|x| x.as_str())
-                    .unwrap_or("/")
-            );
-            let uri = uri_string.parse().unwrap();
-            *req.uri_mut() = uri;
-            let result = self.client.request(req);
-            return Box::pin(async move { Ok(result.await?) });
+            let res = self.reverse_proxy(req).await?;
+            return Ok(res);
         }
 
-        Box::pin(async {
-            Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(NOTFOUND.into())
-                .unwrap())
-        })
-    }
-}
-
-struct MakeSvc {
-    target: SocketAddr,
-    client: HttpClient,
-    workers: Workers,
-}
-
-impl<T> Service<T> for MakeSvc {
-    type Response = Svc;
-    type Error = GenericError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+        Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(NOTFOUND.into())
+            .unwrap())
     }
 
-    fn call(&mut self, _: T) -> Self::Future {
-        let target = self.target.clone();
-        let client = self.client.clone();
-        let workers = self.workers.clone();
-        Box::pin(async move {
-            Ok(Svc {
-                target,
-                client,
-                workers,
-            })
-        })
+    pub async fn reverse_proxy(
+        &self,
+        mut req: Request<Body>,
+    ) -> Result<Response<Body>, GenericError> {
+        let route_name = req.uri().path().strip_prefix("/proxy/").unwrap_or("");
+        println!("Receive {}", route_name);
+        let r = self.workers.get(route_name).await?;
+        if r {
+            println!("Found route")
+        }
+        let uri_string = format!(
+            "http://{}{}",
+            self.target,
+            req.uri()
+                .path_and_query()
+                .map(|x| x.as_str())
+                .unwrap_or("/")
+        );
+        let uri = uri_string.parse().unwrap();
+        *req.uri_mut() = uri;
+        let response = self.client.request(req).await?;
+        Ok(response)
     }
 }
