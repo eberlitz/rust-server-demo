@@ -67,7 +67,7 @@ impl WorkerManager {
         }
     }
 
-    pub async fn spawn(&self, key: &str) -> Result<SocketAddr, AnyError> {
+    async fn spawn(&self, key: &str) -> Result<SocketAddr, AnyError> {
         println!("Creating {}", key);
         // Setup new thread
         async fn handle(_: Request<Body>) -> Result<Response<Body>, Infallible> {
